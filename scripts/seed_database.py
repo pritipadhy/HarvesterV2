@@ -316,7 +316,7 @@ async def seed_customers(session: AsyncSession, tenant_id: str, count: int) -> L
                 source=sig["source"],
                 channel=sig["channel"],
                 event_time=sig["event_time"],
-                metadata=sig["metadata"]
+                signal_metadata=sig["metadata"]
             )
             session.add(signal)
 

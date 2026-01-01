@@ -77,7 +77,7 @@ class CustomerProfile(Base):
 
     # Primary key
     id = Column(Integer, primary_key=True, autoincrement=True)
-    customer_id = Column(String(100), nullable=False, index=True)
+    customer_id = Column(String(100), nullable=False, unique=True, index=True)
     tenant_id = Column(String(50), nullable=False, index=True)
 
     # Customer profile
@@ -167,7 +167,7 @@ class CustomerSignal(Base):
     # Signal value and context
     value = Column(Float)  # Numeric value if applicable
     text_value = Column(Text)  # Text value if applicable
-    metadata = Column(JSONB, default={})
+    signal_metadata = Column(JSONB, default={})
 
     # Source information
     source = Column(String(50))  # kafka, api, crm, oss, etc.
@@ -198,7 +198,7 @@ class CustomerSignal(Base):
             "text_value": self.text_value,
             "channel": self.channel,
             "event_time": self.event_time.isoformat() if self.event_time else None,
-            "metadata": self.metadata
+            "metadata": self.signal_metadata
         }
 
 
