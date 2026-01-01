@@ -8,17 +8,36 @@ This demo runs the full HarvesterV2 intelligence pipeline showing:
 4. Actionable Recommendations (NBA + Retention)
 
 Usage:
+    # Run with hardcoded demo data
     PYTHONPATH=. python scripts/demo_ultimate_system.py
+
+    # Run with database-seeded data
+    PYTHONPATH=. python scripts/demo_ultimate_system.py --from-db
+
+    # Run with Kafka trigger
+    PYTHONPATH=. python scripts/demo_ultimate_system.py --kafka
+
+    # Seed database first, then run
+    PYTHONPATH=. python scripts/demo_ultimate_system.py --seed --from-db
 """
 
 import asyncio
+import argparse
 import json
 import os
+import sys
 from datetime import datetime
 
 # Set API keys
 os.environ["GOOGLE_API_KEY"] = "AIzaSyDyUCWUgzKfjZya5IfrHw308DTHXArHT0c"
 os.environ["TAVILY_API_KEY"] = "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"
+
+# Database configuration
+DATABASE_URL = os.getenv(
+    "HARVESTER_DATABASE_URL",
+    "postgresql://afs_user:harvester_test_2025@localhost:5432/afs_dev"
+)
+ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
 # Demo customer scenario
 DEMO_CUSTOMER = {
@@ -65,8 +84,11 @@ def print_section(title: str, content: any = None):
             print(content)
 
 
-async def run_demo():
+async def run_demo(customer_data: dict = None):
     """Run THE ULTIMATE SYSTEM demo."""
+    # Use provided customer data or default
+    customer = customer_data or DEMO_CUSTOMER
+
     print("\n" + "#" * 70)
     print("#" + " " * 68 + "#")
     print("#" + "  THE ULTIMATE SYSTEM - Unified Customer Intelligence Demo".center(68) + "#")
@@ -76,7 +98,7 @@ async def run_demo():
     print(f"\nDemo started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Show demo customer
-    print_section("DEMO CUSTOMER SCENARIO", DEMO_CUSTOMER["context"])
+    print_section("DEMO CUSTOMER SCENARIO", customer["context"])
 
     print("\n[LOADING] Initializing THE ULTIMATE SYSTEM...")
 
@@ -85,7 +107,7 @@ async def run_demo():
 
         # Initialize the graph
         graph = HarvesterV2Graph(
-            tenant_id="gigaclear",
+            tenant_id=customer.get("tenant_id", "gigaclear"),
             use_checkpointing=False,  # Skip for demo
             use_langfuse=False  # Skip for demo
         )
@@ -101,7 +123,7 @@ async def run_demo():
 
         # Run the pipeline
         start_time = datetime.now()
-        result = await graph.run(DEMO_CUSTOMER)
+        result = await graph.run(customer)
         end_time = datetime.now()
 
         execution_time = (end_time - start_time).total_seconds()
@@ -206,5 +228,208 @@ Summary:
         return None
 
 
+async def load_customer_from_db(customer_id: str, tenant_id: str):
+    """Load customer data from database."""
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+    from sqlalchemy import select
+
+    print(f"\n[LOADING] Loading customer {customer_id} from database...")
+
+    engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    try:
+        from harvester_v2.storage.models import CustomerProfile, CustomerSignal
+
+        async with async_session() as session:
+            # Load customer
+            query = select(CustomerProfile).where(
+                CustomerProfile.customer_id == customer_id,
+                CustomerProfile.tenant_id == tenant_id
+            )
+            result = await session.execute(query)
+            customer = result.scalar_one_or_none()
+
+            if not customer:
+                print(f"[ERROR] Customer {customer_id} not found in database")
+                return None
+
+            # Load recent signals
+            signals_query = select(CustomerSignal).where(
+                CustomerSignal.customer_id == customer_id
+            ).order_by(CustomerSignal.event_time.desc()).limit(20)
+
+            signals_result = await session.execute(signals_query)
+            signals = signals_result.scalars().all()
+
+            # Build customer data
+            customer_data = customer.to_dict()
+            customer_data["context"]["recent_signals"] = [s.to_dict() for s in signals]
+
+            print(f"[OK] Loaded customer: {customer.name} ({customer.segment})")
+            print(f"  - Churn risk: {customer.churn_risk:.2f}")
+            print(f"  - NPS score: {customer.nps_score}")
+            print(f"  - Signals loaded: {len(signals)}")
+
+            return customer_data
+
+    finally:
+        await engine.dispose()
+
+
+async def list_customers_from_db(tenant_id: str, limit: int = 10):
+    """List available customers from database."""
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+    from sqlalchemy import select
+
+    engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    try:
+        from harvester_v2.storage.models import CustomerProfile
+
+        async with async_session() as session:
+            query = select(CustomerProfile).where(
+                CustomerProfile.tenant_id == tenant_id,
+                CustomerProfile.is_active == True
+            ).order_by(CustomerProfile.churn_risk.desc()).limit(limit)
+
+            result = await session.execute(query)
+            customers = result.scalars().all()
+
+            return customers
+
+    finally:
+        await engine.dispose()
+
+
+async def seed_and_run(tenant_id: str):
+    """Seed database and run demo."""
+    print("\n[LOADING] Seeding database...")
+
+    # Import and run seeder
+    from harvester_v2.scripts.seed_database import seed_customers, create_tables
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+
+    engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
+
+    await create_tables(engine)
+
+    async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with async_session() as session:
+        customers = await seed_customers(session, tenant_id, 10)
+        print(f"[OK] Seeded {len(customers)} customers")
+
+    await engine.dispose()
+
+    # Get first high-churn customer
+    customers = await list_customers_from_db(tenant_id)
+    if customers:
+        customer_data = await load_customer_from_db(customers[0].customer_id, tenant_id)
+        if customer_data:
+            return await run_demo(customer_data)
+
+    return None
+
+
+async def run_with_kafka(customer_id: str, tenant_id: str):
+    """Trigger intelligence request via Kafka."""
+    print("\n[LOADING] Sending intelligence request via Kafka...")
+
+    from harvester_v2.services.kafka_service import KafkaService
+
+    kafka = KafkaService()
+    started = await kafka.start()
+
+    if not started:
+        print("[ERROR] Kafka not available")
+        return None
+
+    try:
+        request_id = await kafka.request_intelligence(
+            customer_id=customer_id,
+            tenant_id=tenant_id,
+            priority="high",
+            source="demo"
+        )
+
+        if request_id:
+            print(f"[OK] Intelligence request published: {request_id}")
+            print("\nNote: Start the intelligence worker to process this request:")
+            print("  PYTHONPATH=. python harvester_v2/workers/intelligence_worker.py")
+        else:
+            print("[ERROR] Failed to publish request")
+
+        return request_id
+
+    finally:
+        await kafka.stop()
+
+
+async def main():
+    """Main entry point with argument parsing."""
+    parser = argparse.ArgumentParser(description="THE ULTIMATE SYSTEM Demo")
+    parser.add_argument("--from-db", action="store_true", help="Load customer from database")
+    parser.add_argument("--customer-id", default=None, help="Specific customer ID to load")
+    parser.add_argument("--tenant", default="gigaclear", help="Tenant ID")
+    parser.add_argument("--seed", action="store_true", help="Seed database before running")
+    parser.add_argument("--kafka", action="store_true", help="Trigger via Kafka instead of direct run")
+    parser.add_argument("--list", action="store_true", help="List available customers")
+    args = parser.parse_args()
+
+    if args.list:
+        # List customers from database
+        print("\n" + "=" * 60)
+        print("  Available Customers in Database")
+        print("=" * 60)
+
+        customers = await list_customers_from_db(args.tenant)
+        if not customers:
+            print("\nNo customers found. Run with --seed to add sample data.")
+        else:
+            print(f"\nTenant: {args.tenant}")
+            print(f"{'ID':<20} {'Name':<25} {'Segment':<12} {'Churn Risk':<10}")
+            print("-" * 70)
+            for c in customers:
+                print(f"{c.customer_id:<20} {c.name:<25} {c.segment:<12} {c.churn_risk:.2f}")
+
+        return None
+
+    if args.seed:
+        # Seed and run
+        return await seed_and_run(args.tenant)
+
+    if args.from_db:
+        # Load from database
+        customer_id = args.customer_id
+
+        if not customer_id:
+            # Get highest churn risk customer
+            customers = await list_customers_from_db(args.tenant, limit=1)
+            if not customers:
+                print("[ERROR] No customers in database. Run with --seed first.")
+                return None
+            customer_id = customers[0].customer_id
+
+        customer_data = await load_customer_from_db(customer_id, args.tenant)
+
+        if not customer_data:
+            return None
+
+        if args.kafka:
+            return await run_with_kafka(customer_id, args.tenant)
+        else:
+            return await run_demo(customer_data)
+
+    elif args.kafka:
+        # Kafka with hardcoded customer
+        return await run_with_kafka(DEMO_CUSTOMER["customer_id"], DEMO_CUSTOMER["tenant_id"])
+
+    else:
+        # Run with hardcoded demo data
+        return await run_demo(DEMO_CUSTOMER)
+
+
 if __name__ == "__main__":
-    result = asyncio.run(run_demo())
+    result = asyncio.run(main())
